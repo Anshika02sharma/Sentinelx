@@ -12,3 +12,7 @@ __pycache__/
 
 # Dataset: keep local until its sharing permissions are confirmed
 backend/data/attack_scenario.csv
+
+# Local backups and generated dashboard exports
+frontend/*.bak
+sentinelx_filtered_events.csv
