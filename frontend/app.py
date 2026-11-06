@@ -20,11 +20,16 @@ DATA_FILE = PROJECT_ROOT / "backend" / "data" / "attack_scenario.csv"
 
 try:
     from backend import compare_lsass_rules as lsass_engine
+    from backend import investigation as investigation_engine
+    from backend.smb_correlation import (
+        build_smb_activity_windows, count_smb_activity_windows, parse_smb_time
+    )
     DETECTION_ENGINE_AVAILABLE = True
     DETECTION_IMPORT_ERROR = None
 except Exception as exc:
     DETECTION_ENGINE_AVAILABLE = False
     DETECTION_IMPORT_ERROR = str(exc)
+    investigation_engine = None
 
 
 # ==================================================
@@ -133,178 +138,11 @@ def find_column(columns, candidates):
     return None
 
 
-def parse_smb_time(value):
-    """Parse timestamps without modifying source records."""
-    try:
-        parsed = datetime.fromisoformat(
-            str(value).strip().replace("Z", "+00:00")
-        )
-
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-
-        return parsed
-
-    except (ValueError, TypeError):
-        return None
-
-
-def build_smb_activity_windows(rows, window_seconds=60):
-    """
-    Group SMB events by host and user.
-    Split activity when the gap between consecutive events
-    exceeds the configured time window.
-    """
-
-    execution_terms = (
-        "psexec",
-        "psexesvc",
-        "cmd.exe",
-        "output.txt",
-        "stdin",
-        "stdout",
-        "stderr",
-    )
-
-    grouped = defaultdict(list)
-
-    for row in rows:
-
-        if (
-            (row.get("source_dataset") or "").strip()
-            != "smb_security"
-        ):
-            continue
-
-        timestamp = parse_smb_time(row.get("_time", ""))
-
-        if timestamp is None:
-            continue
-
-        key = (
-            (row.get("host") or "").strip(),
-            (row.get("user") or "").strip(),
-        )
-
-        grouped[key].append((timestamp, row))
-
-    activity_windows = []
-
-    for (host, user), events in sorted(grouped.items()):
-
-        events.sort(key=lambda item: item[0])
-
-        clusters = []
-        current = []
-        previous_time = None
-
-        for timestamp, row in events:
-
-            if (
-                previous_time is not None
-                and (timestamp - previous_time).total_seconds()
-                > window_seconds
-            ):
-                clusters.append(current)
-                current = []
-
-            current.append((timestamp, row))
-            previous_time = timestamp
-
-        if current:
-            clusters.append(current)
-
-        for cluster_number, cluster in enumerate(
-            clusters,
-            start=1,
-        ):
-
-            has_admin_share = any(
-                "admin$" in (
-                    event.get("share_name") or ""
-                ).lower()
-                for _, event in cluster
-            )
-
-            has_execution_target = any(
-                term in (
-                    event.get("relative_target_name") or ""
-                ).lower()
-                for _, event in cluster
-                for term in execution_terms
-            )
-
-            if not (
-                has_admin_share and has_execution_target
-            ):
-                continue
-
-            labels = [
-                (event.get("ground_truth") or "")
-                .strip()
-                .lower()
-                for _, event in cluster
-            ]
-
-            targets = sorted({
-                (
-                    event.get("relative_target_name") or ""
-                ).strip()
-                for _, event in cluster
-                if (
-                    event.get("relative_target_name") or ""
-                ).strip()
-            })
-
-            activity_windows.append({
-                "Host": host,
-                "User": user,
-                "Window": cluster_number,
-                "Events": len(cluster),
-                "Labelled True records": labels.count("true"),
-                "Labelled False records": labels.count("false"),
-                "Targets": "; ".join(targets[:8]),
-                "_events": [
-                    event for _, event in cluster
-                ],
-            })
-
-    return grouped, activity_windows
-
-
-def count_smb_activity_windows(grouped, window_seconds=60):
-    """Count all timestamped SMB activity windows."""
-
-    total_windows = 0
-
-    for events in grouped.values():
-
-        timestamps = sorted(
-            timestamp for timestamp, _ in events
-        )
-
-        if not timestamps:
-            continue
-
-        total_windows += 1
-
-        for previous, current in zip(
-            timestamps,
-            timestamps[1:],
-        ):
-            if (
-                current - previous
-            ).total_seconds() > window_seconds:
-                total_windows += 1
-
-    return total_windows
-
-
 # ==================================================
 # DETECTION LAB
 # ==================================================
 
-def render_detection_lab():
+def render_detection_lab(rows_override=None, dataset_label=None):
 
     st.markdown(
         '<div class="section-title">'
@@ -334,7 +172,11 @@ def render_detection_lab():
         return
 
     try:
-        rows = lsass_engine.load_dataset()
+        rows = (
+            rows_override
+            if rows_override is not None
+            else lsass_engine.load_dataset()
+        )
 
     except Exception as exc:
 
@@ -584,6 +426,46 @@ def render_detection_lab():
             "in the evaluated dataset."
         )
 
+    # Explain an individual LSASS rule outcome with traceable event evidence.
+    st.markdown("#### Explain an LSASS event")
+    lsass_event_options = list(enumerate(lsass_rows))
+    selected_event_index = st.selectbox(
+        "Choose an LSASS event",
+        options=[index for index, _ in lsass_event_options],
+        format_func=lambda index: (
+            f"Event {lsass_rows[index].get('event_id') or index} · "
+            f"{lsass_rows[index].get('host') or 'Unknown host'} · "
+            f"{lsass_rows[index].get('_time') or 'Unknown time'}"
+        ),
+        key="lsass_explain_event",
+    )
+    selected_event = lsass_rows[selected_event_index]
+    selected_prediction = lsass_engine.predict_rule(selected_event, selected_rule)
+    lsass_explanation = investigation_engine.explain_lsass_event(
+        selected_event, selected_rule, selected_prediction
+    )
+    with st.container(border=True):
+        st.markdown(f"**{lsass_explanation['status']}**")
+        st.write(lsass_explanation["why_flagged"])
+        if lsass_explanation["matched_conditions"]:
+            st.markdown("**Matched conditions**")
+            for condition in lsass_explanation["matched_conditions"]:
+                st.write(f"- {condition}")
+        st.markdown("**Supporting event evidence**")
+        st.json(lsass_explanation["supporting_evidence"][0]["fields"])
+        st.markdown("**Signals that could increase confidence**")
+        for signal in lsass_explanation["signals_that_could_increase_confidence"]:
+            st.write(f"- {signal}")
+        st.markdown("**Signals that could reduce confidence**")
+        for signal in lsass_explanation["signals_that_could_reduce_confidence"]:
+            st.write(f"- {signal}")
+        st.markdown("**Limitations / missing evidence**")
+        for item in lsass_explanation["limitations_and_missing_evidence"]:
+            st.write(f"- {item}")
+        st.markdown("**Recommended next steps**")
+        for item in lsass_explanation["recommended_next_steps"]:
+            st.write(f"- {item}")
+
     st.divider()
 
     # --------------------------------------------------
@@ -747,7 +629,37 @@ def render_detection_lab():
             mime="text/csv",
         )
 
+        # Evidence-led explanation for every flagged SMB activity window.
+        st.markdown("#### Why each SMB window was flagged")
+        smb_findings = []
+        for candidate_index, candidate in enumerate(smb_candidates, start=1):
+            finding = investigation_engine.explain_smb_window(candidate, window_seconds=60)
+            smb_findings.append(finding)
+            with st.expander(f"{candidate.get('Host', 'Unknown host')} · {candidate.get('User', 'Unknown user')} · Window {candidate.get('Window', candidate_index)}"):
+                st.markdown(f"**{finding['status']}**")
+                st.write(finding["why_flagged"])
+                st.markdown("**Matched conditions**")
+                for condition in finding["matched_conditions"]:
+                    st.write(f"- {condition['condition']}: {'Matched' if condition['matched'] else 'Not matched'} ({condition['matching_event_count']} event(s))")
+                st.markdown("**Supporting evidence**")
+                for evidence in finding["supporting_evidence"]:
+                    st.write(f"- **{evidence['type']}:** {evidence['detail']}")
+                    if evidence.get("targets"):
+                        st.write("  Targets: " + "; ".join(evidence["targets"]))
+                    if evidence.get("matched_terms"):
+                        st.write("  Matched terms: " + ", ".join(evidence["matched_terms"]))
+                if finding.get("evidence_events"):
+                    st.markdown("**Exact matching source events**")
+                    st.dataframe(pd.DataFrame(finding["evidence_events"]), width="stretch", hide_index=True)
+                st.markdown(f"**Evidence assessment:** {finding['confidence_assessment']['label']}")
+                st.caption(finding["confidence_assessment"]["meaning"])
+                for heading, key in (("Signals that could increase confidence", "signals_that_could_increase_confidence"), ("Signals that could reduce confidence", "signals_that_could_reduce_confidence"), ("Limitations and missing evidence", "limitations_and_missing_evidence"), ("Recommended next steps", "recommended_next_steps")):
+                    st.markdown(f"**{heading}**")
+                    for item in finding[key]:
+                        st.write(f"- {item}")
+
     else:
+        smb_findings = []
 
         st.success(
             "No SMB activity windows matched the configured "
@@ -760,6 +672,51 @@ def render_detection_lab():
         "activity windows rather than evaluating validated window-level "
         "ground truth."
     )
+
+    # Export a combined, evidence-led investigation report.
+    lsass_findings = [
+        investigation_engine.explain_lsass_event(
+            event, selected_rule, lsass_engine.predict_rule(event, selected_rule)
+        )
+        for event in lsass_rows
+    ]
+    report = investigation_engine.build_investigation_report(
+        dataset_name=str(dataset_label or DATA_FILE.name),
+        lsass_findings=lsass_findings,
+        smb_findings=smb_findings,
+        summary={
+            "selected_lsass_rule": selected_rule,
+            "labelled_lsass_records": len(lsass_rows),
+            "true_positives": result["TP"],
+            "false_positives": result["FP"],
+            "false_negatives": result["FN"],
+            "true_negatives": result["TN"],
+            "precision": f"{result['precision']:.2%}",
+            "recall": f"{result['recall']:.2%}",
+            "f1_score": f"{result['f1']:.2%}",
+            "smb_candidate_windows": len(smb_findings),
+        },
+    )
+    st.divider()
+    st.markdown("### Investigation report")
+    st.caption("Export includes rule outcomes, explanations, event evidence, corroborating signals, limitations and recommended investigation steps.")
+    report_col1, report_col2 = st.columns(2)
+    with report_col1:
+        st.download_button(
+            "Download investigation report (Markdown)",
+            data=investigation_engine.report_as_markdown(report),
+            file_name="sentinelx_investigation_report.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+    with report_col2:
+        st.download_button(
+            "Download investigation report (JSON)",
+            data=investigation_engine.report_as_json(report),
+            file_name="sentinelx_investigation_report.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
 
 # ==================================================
@@ -851,7 +808,12 @@ st.markdown("""
 
 if page == "Detection Lab":
 
-    render_detection_lab()
+    detection_rows = (
+        data.fillna("").astype(str).to_dict(orient="records")
+        if data is not None and not data.empty
+        else None
+    )
+    render_detection_lab(detection_rows, data_source)
 
 
 # ==================================================
